@@ -256,7 +256,9 @@ const LEDGER_SPECS_ = {
 function syncHumanLedgers_(store, collections, skipReconcile = false) {
   const unique = [...new Set(collections || Object.keys(LEDGER_SPECS_))];
   if (unique.includes("inventory") && !skipReconcile) {
-    try { reconcileHumanInventory_(store); } catch (_e) {}
+    try { reconcileHumanInventory_(store); } catch (_e) {
+      console.warn("reconcileHumanInventory_ failed: " + (_e && _e.message ? _e.message : _e));
+    }
   }
   for (const col of unique) {
     const spec = LEDGER_SPECS_[col];

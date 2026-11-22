@@ -324,12 +324,25 @@ function execute(store, request, payloadHash, now) {
   const payload=request.payload || {};
   if (request.action==="get" || request.action==="list") {
     if (!Collections.includes(payload.collection)) throw new Error("UNKNOWN_COLLECTION");
+    let reconcileError = null;
     if (payload.collection==="inventory") {
-      try { reconcileHumanInventory_(store); } catch (_e) {}
+      try { reconcileHumanInventory_(store); } catch (err) {
+        reconcileError = String(err && err.message ? err.message : err);
+      }
     }
     if (request.action==="get") return {record:store.get(payload.collection,payload.id)};
     const limit=Math.max(1,Math.min(Number(payload.limit)||100,500));
-    return {records:store.list(payload.collection).sort((a,b)=>b.updated_at.localeCompare(a.updated_at)).slice(0,limit)};
+    const offset=Math.max(0,Number(payload.offset)||0);
+    const all=store.list(payload.collection).sort((a,b)=>b.updated_at.localeCompare(a.updated_at));
+    const slice=all.slice(offset,offset+limit);
+    const result={
+      records: slice,
+      total: all.length,
+      has_more: (offset + slice.length) < all.length,
+      next_offset: offset + slice.length
+    };
+    if (reconcileError) result.reconciliation_error = reconcileError;
+    return result;
   }
   if (request.action!=="mutate") throw new Error("UNKNOWN_ACTION");
   const previous=store.operation(request.request_id);

@@ -85,11 +85,12 @@ def test_a02_legacy_auto_mode_dispatch_policy(test_env):
     runner.autonomy_mode = "auto"
     assert runner.can_send is False, "Legacy unmigrated auto mode reproduces DISPATCH_DISABLED"
 
-    # After settings migration, auto becomes draft
+    # Under Phase 1 canonical modes table, legacy auto migrates to turbo (historical automatic intent)
     cfg = DeskSettings.model_validate({"autonomy_mode": "auto"})
-    assert cfg.autonomy_mode == "draft"
+    assert cfg.autonomy_mode == "turbo"
+    assert "auto -> turbo" in cfg.legacy_autonomy_migration
     runner.autonomy_mode = cfg.autonomy_mode
-    assert runner.can_send is True, "Migrated draft mode enables supervised send"
+    assert runner.can_send is True, "Migrated turbo mode enables supervised send"
 
 
 def test_a02_settings_accepts_legacy_modes():

@@ -352,10 +352,10 @@ class DesktopService:
                 self.runner.last_stopped_at = float(cursor["last_stopped_at"])
             if isinstance(cursor.get("last_event_ts"), (int, float)):
                 self.runner.last_event_ts = float(cursor["last_event_ts"])
-            if cursor.get("running") and self.configuration:
-                if hasattr(self.runner, "begin_session"):
-                    self.runner.begin_session()
-                self.runner.active = True
+            # Always boot stopped: cached running=True or crash never starts active session.
+            # Startup lock requires explicit Start to begin a new epoch.
+            self.runner.active = False
+            self.runner.always_start_stopped = True
 
     def _save_runtime_cache(self):
         if not self._cache_path:
@@ -2206,8 +2206,8 @@ class DesktopService:
             self._bg_diag_task.cancel()
         if self._warm_task and not self._warm_task.done():
             self._warm_task.cancel()
-        self._save_runtime_cache()
         self.runner.active = False
+        self._save_runtime_cache()
         self.runner.bridge.stop()
         self.repo.close()
         self.diagnostics.close()

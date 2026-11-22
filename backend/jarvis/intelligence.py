@@ -6,7 +6,7 @@ import time
 from datetime import datetime,timezone,timedelta
 import re
 from typing import Literal
-from pydantic import BaseModel,ConfigDict,Field,field_validator
+from pydantic import BaseModel,ConfigDict,Field,field_validator,model_validator
 from urllib.parse import urlsplit
 
 
@@ -33,23 +33,73 @@ class DeskSettings(BaseModel):
     agent_allow_writes: bool=False
     agent_proactive_insights: bool=True
     agent_max_tool_steps: int=Field(default=6,ge=2,le=10)
-    autonomy_mode: Literal["observe","draft","send","turbo","auto","approved_auto"]="observe"
+
+    # Startup & Display
+    always_start_stopped: bool=True
+    ui_scale: int=Field(default=100,ge=50,le=200)
+
+    # Autonomy & Dispatch
+    autonomy_mode: Literal["observe","draft","send","turbo"]="observe"
+    legacy_autonomy_migration: str | None=None
     auto_reply_max_usd: float=Field(default=5000.0,ge=0,le=500000)
+    reply_bubble_mode: Literal["single","two_bubble"]="single"
+    group_auto_reply_enabled: bool=False
+    human_mute_hours: float=Field(default=4.0,ge=0.25,le=48.0)
+    dispatch_jitter_min_ms: int=Field(default=1500,ge=0,le=60000)
+    dispatch_jitter_max_ms: int=Field(default=4200,ge=0,le=60000)
+
+    # Demand & Sourcing
+    min_buy_quantity_threshold: int=Field(default=1,ge=1)
+    below_moq_policy: Literal["hold","explain"]="hold"
+    min_buyers_for_seller_outreach: int=Field(default=2,ge=1)
+    min_total_qty_for_seller_outreach: int=Field(default=5,ge=1)
+    offer_freshness_ttl_hours: float=Field(default=24.0,ge=0.1)
+
+    # Price & FX
     default_margin_pct: float=Field(default=3.5,ge=0,le=50)
+    min_margin_floor_pct: float=Field(default=0.0,ge=0.0)
     volatility_aa_cap_pct: float=Field(default=2.0,ge=0,le=10)
+    quote_validity_minutes: int=Field(default=30,ge=1,le=1440)
+    show_usd_alongside_local: bool=False
+
+    # Hours & Schedules
     working_hours_start: str=Field(default="08:30",pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
     working_hours_end: str=Field(default="21:30",pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
-    human_mute_hours: float=Field(default=4.0,ge=0.5,le=48.0)
-    ui_scale: int=Field(default=100,ge=50,le=200)
-    @field_validator("autonomy_mode", mode="before")
+    morning_dispatch_time: str=Field(default="08:45",pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    off_hours_generate_and_schedule: bool=True
+    reprice_fx_on_wake: bool=True
+    out_of_stock_auto_reply_enabled: bool=True
+    partial_stock_policy: Literal["quote_available_with_gap","hold_for_review"]="quote_available_with_gap"
+
+    # Alerts & Notifications
+    notify_deal_matches: bool=True
+    notify_high_demand: bool=True
+    notify_sourcing_gaps: bool=True
+    notify_critical_errors: bool=True
+    buyer_repeat_cooldown_seconds: int=Field(default=15,ge=0,le=300)
+
+    @model_validator(mode="before")
     @classmethod
-    def migrate_autonomy_mode(cls, v):
-        raw = str(v or "observe").strip().lower()
-        if raw in ("auto", "approved_auto"):
-            return "draft"
-        if raw in ("observe", "draft", "send", "turbo"):
-            return raw
-        return "observe"
+    def pre_migrate(cls, data):
+        if isinstance(data, dict):
+            raw_mode = str(data.get("autonomy_mode") or "").strip().lower()
+            if raw_mode == "auto":
+                data["autonomy_mode"] = "turbo"
+                data["legacy_autonomy_migration"] = "Migrated legacy auto -> turbo (historical automatic intent)"
+            elif raw_mode == "approved_auto":
+                data["autonomy_mode"] = "draft"
+                data["legacy_autonomy_migration"] = "Migrated legacy approved_auto -> draft (historical approval intent)"
+            elif raw_mode and raw_mode not in ("observe", "draft", "send", "turbo"):
+                raise ValueError(f"Invalid autonomy_mode '{raw_mode}'. Allowed modes are: observe, draft, send, turbo.")
+        return data
+
+    @model_validator(mode="after")
+    def validate_jitter(self):
+        if self.dispatch_jitter_min_ms > self.dispatch_jitter_max_ms:
+            raise ValueError("dispatch_jitter_min_ms cannot exceed dispatch_jitter_max_ms")
+        return self
+
+
     @field_validator("agent_name")
     @classmethod
     def check_agent_name(cls,v):

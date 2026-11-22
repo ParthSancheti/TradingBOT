@@ -106,8 +106,33 @@ class SheetsRepository:
     def __init__(self, client): self.client=client
     async def get(self, collection, record_id):
         return (await self.client.call("get",{"collection":collection,"id":record_id})).get("record")
-    async def list(self, collection, limit=100):
-        return (await self.client.call("list",{"collection":collection,"limit":limit}))["records"]
+    async def list(self, collection, limit=100, offset=0):
+        resp = await self.client.call("list", {"collection": collection, "limit": limit, "offset": offset})
+        if isinstance(resp, dict):
+            return resp.get("records", [])
+        return resp or []
+
+    async def list_all(self, collection, page_size=500):
+        """Fetch complete collection across pages stably."""
+        all_records = []
+        offset = 0
+        limit = min(max(1, page_size), 500)
+        while True:
+            resp = await self.client.call("list", {"collection": collection, "limit": limit, "offset": offset})
+            records = resp.get("records", []) if isinstance(resp, dict) else (resp or [])
+            if not records:
+                break
+            all_records.extend(records)
+            has_more = resp.get("has_more") if isinstance(resp, dict) else None
+            total = resp.get("total") if isinstance(resp, dict) else None
+            if has_more is False:
+                break
+            if len(records) < limit:
+                break
+            if total is not None and len(all_records) >= total:
+                break
+            offset += len(records)
+        return all_records
     async def put(self, collection, record_id, data, expected_revision, request_id=None):
         result=await self.client.call("mutate",{"changes":[{"collection":collection,"id":record_id,"expected_revision":expected_revision,"data":data}]},request_id)
         return result["records"][0]
@@ -117,5 +142,5 @@ class SheetsRepository:
 
 
 class UnconfiguredRepository:
-    async def get(self,*args): raise SheetsError("SHEETS_NOT_CONFIGURED")
-    list = put = health = batch = get
+    async def get(self,*args,**kwargs): raise SheetsError("SHEETS_NOT_CONFIGURED")
+    list = list_all = put = health = batch = get

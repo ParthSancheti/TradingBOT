@@ -647,10 +647,12 @@ class SQLiteSyncedRepository:
             ).fetchone():
                 return
             remote_revision = self._sheet_revision(collection, record_id)
-            if remote_revision is not None and revision <= remote_revision:
-                return
             existing = self._conn.execute("SELECT revision FROM records WHERE collection=? AND id=?",
                                           (collection, record_id)).fetchone()
+            # If the record already exists locally and remote revision is not newer, skip.
+            # But if the record is missing locally (e.g. from earlier aggressive pruning), recover it!
+            if existing is not None and remote_revision is not None and revision <= remote_revision:
+                return
             local_revision = max(int(revision), int(existing["revision"]) + 1 if existing else 0)
             self._conn.execute(
                 """INSERT INTO records(collection, id, revision, updated_at, data_json)
@@ -1053,16 +1055,39 @@ class SQLiteSyncedRepository:
         pulled = {}
         for collection in collections:
             try:
-                rows = await self.remote.list(collection, 500)
+                if hasattr(self.remote, "list_all"):
+                    rows = await self.remote.list_all(collection, 500)
+                else:
+                    all_rows = []
+                    offset = 0
+                    while True:
+                        try:
+                            page = await self.remote.list(collection, 500, offset=offset)
+                        except TypeError:
+                            page = await self.remote.list(collection, 500)
+                            all_rows = page if isinstance(page, list) else (page.get("records", []) if isinstance(page, dict) else [])
+                            break
+                        page_items = page if isinstance(page, list) else (page.get("records", []) if isinstance(page, dict) else [])
+                        if not page_items:
+                            break
+                        all_rows.extend(page_items)
+                        has_more = page.get("has_more") if isinstance(page, dict) else None
+                        if has_more is False or len(page_items) < 500:
+                            break
+                        offset += len(page_items)
+                    rows = all_rows
             except Exception:
                 pulled[collection] = None
                 continue
+
             remote_ids = set()
             for row in rows:
                 remote_ids.add(row["id"])
                 self._upsert_local(collection, row["id"], row["data"], row["revision"], row["updated_at"])
+
             # Prune authoritative records (inventory, offers) deleted on remote that have no pending local edits
-            if collection in ("inventory", "offers") and rows:
+            # Only prune if enumeration completed cleanly across the full dataset
+            if collection in ("inventory", "offers"):
                 with self._lock, self._conn:
                     local_rows = self._conn.execute(
                         "SELECT id FROM records WHERE collection=?", (collection,)
@@ -1075,6 +1100,7 @@ class SQLiteSyncedRepository:
                             ).fetchone()
                             if not is_pending:
                                 self._conn.execute("DELETE FROM records WHERE collection=? AND id=?", (collection, lid))
+                                self._conn.execute("DELETE FROM sheets_revisions WHERE collection=? AND id=?", (collection, lid))
             pulled[collection] = len(rows)
         return pulled
 
@@ -1364,10 +1390,11 @@ class SQLiteSyncedRepository:
             self._conn.execute("UPDATE outbound_queue SET status='READY', updated_at=? WHERE id=?", (now, oid))
             return None
 
-    def _quote_is_current(self, row, metadata):
+    def _quote_is_current(self, row, metadata, quote_validity_seconds=None):
         if row["status"] in ("NEEDS_PRICE_REVIEW", "DRAFT"):
             return True
-        if not (metadata.get("pricing") or {}).get("quote_usd") or time.time() - row["created_at"] > 600:
+        validity = quote_validity_seconds or metadata.get("quote_validity_seconds") or 1800
+        if not (metadata.get("pricing") or {}).get("quote_usd") or time.time() - row["created_at"] > validity:
             return False
         revision = metadata.get("snapshot_revision")
         if revision is None:
