@@ -54,6 +54,57 @@ async function triggerDirectPump() {
       const caption = claimData.item.caption;
       const meta = claimData.item.meta || {};
 
+      // F02: Native target verification
+      if (typeof targetJid !== 'string' || !targetJid) {
+        await request('outbound/dispatch', {
+          operation: 'dispatch_result',
+          outbound_id: oid,
+          session_id: sessionId,
+          claim_token: claimToken,
+          outcome: 'FAILED_BEFORE_SEND',
+          reason: 'INVALID_RECIPIENT_JID',
+        }).catch(() => {});
+        continue;
+      }
+      if (targetJid.endsWith('@g.us')) {
+        await request('outbound/dispatch', {
+          operation: 'dispatch_result',
+          outbound_id: oid,
+          session_id: sessionId,
+          claim_token: claimToken,
+          outcome: 'FAILED_BEFORE_SEND',
+          reason: 'GROUP_DISPATCH_DISABLED',
+        }).catch(() => {});
+        continue;
+      }
+      if (targetJid.endsWith('@c.us') || targetJid.endsWith('@s.whatsapp.net')) {
+        const jidDigits = targetJid.split('@')[0].replace(/\D/g, '');
+        const phoneDigits = String(claimData.item.recipient_phone || '').replace(/\D/g, '');
+        if (!jidDigits || jidDigits !== phoneDigits) {
+          await request('outbound/dispatch', {
+            operation: 'dispatch_result',
+            outbound_id: oid,
+            session_id: sessionId,
+            claim_token: claimToken,
+            outcome: 'FAILED_BEFORE_SEND',
+            reason: 'RECIPIENT_PHONE_MISMATCH',
+          }).catch(() => {});
+          continue;
+        }
+      }
+      const currentWaPhone = waClient.profile?.phone;
+      if (currentWaPhone && currentWaPhone.replace(/\D/g, '') !== accountPhone.replace(/\D/g, '')) {
+        await request('outbound/dispatch', {
+          operation: 'dispatch_result',
+          outbound_id: oid,
+          session_id: sessionId,
+          claim_token: claimToken,
+          outcome: 'FAILED_BEFORE_SEND',
+          reason: 'WHATSAPP_ACCOUNT_CHANGED',
+        }).catch(() => {});
+        continue;
+      }
+
       const authRes = await request('outbound/dispatch', {
         operation: 'dispatch_authorize',
         outbound_id: oid,
@@ -75,6 +126,44 @@ async function triggerDirectPump() {
       }
 
       const expiresAt = authRes.result.expires_at;
+
+      // F10: Closed-failure on missing or unreadable attachment (never send different content than approved)
+      let attachmentObj = null;
+      if (attachmentPath) {
+        if (!existsSync(attachmentPath)) {
+          await request('outbound/dispatch', {
+            operation: 'dispatch_result',
+            outbound_id: oid,
+            session_id: sessionId,
+            claim_token: claimToken,
+            outcome: 'FAILED_BEFORE_SEND',
+            reason: 'ATTACHMENT_NOT_FOUND',
+          }).catch(() => {});
+          continue;
+        }
+        try {
+          const fileBuf = await fs.readFile(attachmentPath);
+          attachmentObj = {
+            buffer: fileBuf,
+            name: meta.attachment_name || path.basename(attachmentPath),
+            mime: meta.attachment_mime || 'application/octet-stream',
+            caption: caption || '',
+            type: meta.attachment_type || 'document',
+          };
+        } catch (readErr) {
+          await request('outbound/dispatch', {
+            operation: 'dispatch_result',
+            outbound_id: oid,
+            session_id: sessionId,
+            claim_token: claimToken,
+            outcome: 'FAILED_BEFORE_SEND',
+            reason: 'ATTACHMENT_UNREADABLE',
+          }).catch(() => {});
+          continue;
+        }
+      }
+
+      // Recheck expiry at the last possible moment before invocation
       if (expiresAt && Date.now() >= expiresAt * 1000) {
         await request('outbound/dispatch', {
           operation: 'dispatch_result',
@@ -85,20 +174,6 @@ async function triggerDirectPump() {
           reason: 'DISPATCH_AUTHORIZATION_EXPIRED',
         }).catch(() => {});
         continue;
-      }
-
-      let attachmentObj = null;
-      if (attachmentPath && existsSync(attachmentPath)) {
-        try {
-          const fileBuf = await fs.readFile(attachmentPath);
-          attachmentObj = {
-            buffer: fileBuf,
-            name: meta.attachment_name || path.basename(attachmentPath),
-            mime: meta.attachment_mime || 'application/octet-stream',
-            caption: caption || '',
-            type: meta.attachment_type || 'document',
-          };
-        } catch {}
       }
 
       let sendRes;
@@ -116,6 +191,7 @@ async function triggerDirectPump() {
           claim_token: claimToken,
           outcome: 'ACCEPTED',
           sent_ids: sendRes.sent_ids,
+          transport: 'native',
         }).catch(() => {});
       } else if (sendRes?.ambiguous) {
         await request('outbound/dispatch', {
@@ -125,6 +201,9 @@ async function triggerDirectPump() {
           claim_token: claimToken,
           outcome: 'UNKNOWN',
           reason: sendRes?.reason || 'SEND_AMBIGUOUS_AFTER_INVOCATION',
+          transport: 'native',
+          ...(sendRes.sent_ids ? { sent_ids: sendRes.sent_ids } : {}),
+          ...(sendRes.parts_sent !== undefined ? { parts_sent: sendRes.parts_sent } : {}),
         }).catch(() => {});
       } else {
         await request('outbound/dispatch', {
@@ -134,6 +213,7 @@ async function triggerDirectPump() {
           claim_token: claimToken,
           outcome: 'FAILED_BEFORE_SEND',
           reason: sendRes?.reason || 'SEND_DIRECT_FAILED',
+          transport: 'native',
         }).catch(() => {});
       }
     }
@@ -219,6 +299,11 @@ const waClient = new WaDirectClient({
   onMessages: async (events) => {
     if (engine && engine.exitCode === null && !engine.killed && Array.isArray(events) && events.length) {
       await enqueueDirectEvents(events);
+    }
+  },
+  onHumanReplies: async (replies) => {
+    if (engine && engine.exitCode === null && !engine.killed && Array.isArray(replies) && replies.length) {
+      await request('wa/sync', { human_replies: replies }).catch(() => {});
     }
   },
 });

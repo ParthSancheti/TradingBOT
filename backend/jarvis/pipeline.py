@@ -213,7 +213,7 @@ class IntakePipeline:
                 return {"status": "DUPLICATE", "id": existing_out["id"], "message_id": event["message_id"]}
             # Human staff takeover detected (outgoing message without bot receipt)
             if hasattr(self.repository, "has_outbound_receipt") and not self.repository.has_outbound_receipt(event["message_id"]):
-                mute_hours = float(setup.get("human_mute_hours") or 1.0)
+                mute_hours = float(setup.get("human_mute_hours") or 4.0)
                 mute_sec = int(mute_hours * 3600)
                 if hasattr(self.repository, "upsert_contact"):
                     self.repository.upsert_contact(conversation, manual_mute_seconds=mute_sec)

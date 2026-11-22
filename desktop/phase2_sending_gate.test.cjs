@@ -82,3 +82,41 @@ test('Phase 2 Contract: wa-direct rejects sends when disconnected', async () => 
   assert.equal(res.ok, false);
   assert.equal(res.reason, 'DIRECT_WA_DISCONNECTED');
 });
+
+test('Phase 2 F07: wa-direct echo detection suppresses human reply classification for bot sent IDs', async () => {
+  let humanReplies = [];
+  const client = new WaDirectClient({
+    authDir: path.join(__dirname, '..', '.runtime', 'test-auth'),
+    onHumanReplies: (replies) => { humanReplies.push(...replies); },
+  });
+  client.state = 'connected';
+  client._recentSentIds.set('3EB0BOTMSG123', Date.now());
+
+  // Simulate messages.upsert handler directly
+  assert.equal(client.isRecentSentId('3EB0BOTMSG123'), true);
+  assert.equal(client.isRecentSentId('true_12025550102@c.us_3EB0BOTMSG123'), true);
+  assert.equal(client.isRecentSentId('UNKNOWN_MANUAL_MSG'), false);
+});
+
+test('Phase 2 Two-Bubble: sendDirect preserves part 1 sent_ids if part 2 fails', async () => {
+  const client = new WaDirectClient({ authDir: path.join(__dirname, '..', '.runtime', 'test-auth') });
+  client.state = 'connected';
+  let callCount = 0;
+  client.sock = {
+    sendMessage: async (jid, payload) => {
+      callCount++;
+      if (callCount === 1) {
+        return { key: { id: 'PART1_SUCCESS_ID' } };
+      }
+      throw new Error('Connection timeout on part 2');
+    },
+  };
+
+  const res = await client.sendDirect('12025550102@c.us', ['Bubble 1 quote', 'Bubble 2 total']);
+  assert.equal(res.ok, false);
+  assert.equal(res.ambiguous, true);
+  assert.deepEqual(res.sent_ids, ['PART1_SUCCESS_ID']);
+  assert.equal(res.parts_sent, 1);
+  assert.equal(res.total_parts, 2);
+  assert.ok(client.isRecentSentId('PART1_SUCCESS_ID'));
+});

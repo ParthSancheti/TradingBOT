@@ -27,6 +27,8 @@ METHODS.add('outbound/dispatch');
 METHODS.add('inventory/daily-stock');
 METHODS.add('contacts/list');
 METHODS.add('contacts/tag');
+METHODS.add('contacts/unmute');
+METHODS.add('contacts/mute-status');
 METHODS.add('scheduler/list');
 METHODS.add('inventory/parse');
 METHODS.add('diagnostics/logs');

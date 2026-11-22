@@ -871,6 +871,47 @@
     $('wa-active-phone').textContent = grp.isGroup ? `Group · ${grp.convId}` : (grp.phone || 'WhatsApp Verified Contact');
     $('wa-active-avatar').textContent = grp.isGroup ? '👥' : (grp.name.replace(/[^\p{L}]/gu, '').slice(0, 2).toUpperCase() || 'WA');
 
+    const muteBadge = $('wa-mute-badge');
+    const unmuteBtn = $('wa-action-unmute');
+    if (muteBadge && unmuteBtn) {
+      if (grp.isGroup) {
+        muteBadge.hidden = true;
+        unmuteBtn.hidden = true;
+      } else {
+        JarvisApp.request('contacts/mute-status', { conversation_id: grp.convId })
+          .then((res) => {
+            const st = res?.result || res || {};
+            if (st.muted && !st.blocked) {
+              const mins = Math.max(1, Math.round((st.remaining_seconds || 0) / 60));
+              const hrs = Math.floor(mins / 60);
+              const remMins = mins % 60;
+              const timeStr = hrs > 0 ? `${hrs}h ${remMins}m` : `${remMins}m`;
+              muteBadge.textContent = `🔇 Muted (${timeStr} left)`;
+              muteBadge.hidden = false;
+              unmuteBtn.hidden = false;
+            } else {
+              muteBadge.hidden = true;
+              unmuteBtn.hidden = true;
+            }
+          })
+          .catch(() => {
+            muteBadge.hidden = true;
+            unmuteBtn.hidden = true;
+          });
+
+        unmuteBtn.onclick = async () => {
+          try {
+            await JarvisApp.request('contacts/unmute', { conversation_id: grp.convId });
+            muteBadge.hidden = true;
+            unmuteBtn.hidden = true;
+            toast('Chat unmuted.');
+          } catch {
+            toast('Failed to unmute chat.');
+          }
+        };
+      }
+    }
+
     const input = $('wa-composer-input');
     const sendBtn = $('wa-composer-send');
     if (grp.isGroup) {

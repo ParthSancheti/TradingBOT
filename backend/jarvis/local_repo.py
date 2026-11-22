@@ -9,6 +9,22 @@ import sqlite3
 import threading
 import time
 import uuid
+
+
+def normalize_whatsapp_msg_id(mid):
+    if not isinstance(mid, str):
+        return []
+    mid = mid.strip()
+    if not mid:
+        return []
+    candidates = {mid}
+    parts = mid.split("_")
+    if len(parts) >= 3 and parts[0] in ("true", "false"):
+        candidates.add(parts[-1])
+        candidates.add("_".join(parts[2:]))
+    elif len(parts) == 2:
+        candidates.add(parts[-1])
+    return [c for c in candidates if c]
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,6 +44,7 @@ class SQLiteSyncedRepository:
         self._lock = threading.RLock()
         self._flush_lock = asyncio.Lock()
         self._flush_task = None
+        self._recent_sent_ids = {}
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=15.0)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
@@ -187,7 +204,11 @@ class SQLiteSyncedRepository:
             # Startup crash recovery: IN_FLIGHT -> UNKNOWN, CLAIMED -> READY
             c.execute(
                 """UPDATE outbound_queue
-                   SET status=CASE status WHEN 'IN_FLIGHT' THEN 'UNKNOWN' ELSE 'READY' END, updated_at=?
+                   SET status=CASE status WHEN 'IN_FLIGHT' THEN 'UNKNOWN' ELSE 'READY' END,
+                       updated_at=?,
+                       meta_json=CASE status WHEN 'IN_FLIGHT'
+                         THEN json_set(meta_json, '$.failure_reason', 'PROCESS_RESTARTED_WHILE_IN_FLIGHT', '$.reason', 'PROCESS_RESTARTED_WHILE_IN_FLIGHT')
+                         ELSE meta_json END
                    WHERE status IN ('CLAIMED', 'IN_FLIGHT')""",
                 (time.time(),),
             )
@@ -1191,13 +1212,66 @@ class SQLiteSyncedRepository:
             return [dict(r) for r in self._conn.execute(q, args).fetchall()]
 
     def is_chat_muted(self, conversation_id):
+        if not conversation_id:
+            return False
+        with self._lock:
+            now = time.time()
+            row = self._conn.execute("SELECT manual_mute_until, category, phone FROM contact_profiles WHERE conversation_id=?", (conversation_id,)).fetchone()
+            if row:
+                if row["category"] in ("FAMILY_PERSONAL", "IGNORED"):
+                    return True
+                if float(row["manual_mute_until"] or 0) > now:
+                    return True
+            clean_digits = re.sub(r"\D", "", conversation_id.split("@")[0] if "@" in str(conversation_id) else str(conversation_id))
+            if clean_digits:
+                row_alias = self._conn.execute(
+                    "SELECT manual_mute_until, category FROM contact_profiles WHERE (phone LIKE ? OR conversation_id LIKE ?) AND manual_mute_until > ? LIMIT 1",
+                    (f"%{clean_digits}%", f"%{clean_digits}%", now),
+                ).fetchone()
+                if row_alias:
+                    return True
+            return False
+
+    def unmute_chat(self, conversation_id):
+        if not conversation_id:
+            return
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute("SELECT phone FROM contact_profiles WHERE conversation_id=?", (conversation_id,)).fetchone()
+            phone = row["phone"] if row else None
+            self._conn.execute(
+                "UPDATE contact_profiles SET manual_mute_until=0, updated_at=? WHERE conversation_id=?",
+                (now, conversation_id),
+            )
+            if phone:
+                clean_phone = re.sub(r"\D", "", str(phone))
+                if clean_phone:
+                    self._conn.execute(
+                        "UPDATE contact_profiles SET manual_mute_until=0, updated_at=? WHERE phone=? OR conversation_id LIKE ?",
+                        (now, phone, f"%{clean_phone}%"),
+                    )
+            self._conn.commit()
+
+    def get_chat_mute_status(self, conversation_id):
+        if not conversation_id:
+            return {"muted": False, "manual_mute_until": 0.0, "remaining_seconds": 0.0}
+        now = time.time()
         with self._lock:
             row = self._conn.execute("SELECT manual_mute_until, category FROM contact_profiles WHERE conversation_id=?", (conversation_id,)).fetchone()
             if not row:
-                return False
+                clean_digits = re.sub(r"\D", "", conversation_id.split("@")[0] if "@" in str(conversation_id) else str(conversation_id))
+                if clean_digits:
+                    row = self._conn.execute(
+                        "SELECT manual_mute_until, category FROM contact_profiles WHERE (phone LIKE ? OR conversation_id LIKE ?) LIMIT 1",
+                        (f"%{clean_digits}%", f"%{clean_digits}%"),
+                    ).fetchone()
+            if not row:
+                return {"muted": False, "manual_mute_until": 0.0, "remaining_seconds": 0.0}
             if row["category"] in ("FAMILY_PERSONAL", "IGNORED"):
-                return True
-            return float(row["manual_mute_until"] or 0) > time.time()
+                return {"muted": True, "blocked": True, "category": row["category"], "manual_mute_until": 0.0, "remaining_seconds": 0.0}
+            until = float(row["manual_mute_until"] or 0)
+            remaining = max(0.0, until - now)
+            return {"muted": remaining > 0, "blocked": False, "manual_mute_until": until, "remaining_seconds": remaining}
 
     # --- LID <-> Phone Mapping ---
     def save_lid_phone(self, lid, phone, name=None):
@@ -1273,26 +1347,91 @@ class SQLiteSyncedRepository:
             )
             self._conn.commit()
 
+    def _verify_outbound_target(self, row, account_phone, allowed_phones=None, allow_group=False, is_dispatch=False):
+        phone = row.get("recipient_phone") or ""
+        jid = row.get("recipient_jid") or ""
+        kind = row.get("kind") or ""
+        is_manual = (kind == "manual")
+        is_agent_reply = (kind == "agent_reply")
+
+        def _digits(p):
+            return re.sub(r"\D", "", str(p or ""))
+
+        phone_digits = _digits(phone)
+        account_digits = _digits(account_phone)
+
+        # 1. Reject self-send and empty/unauthorized account
+        if not phone_digits or not account_digits or (phone_digits == account_digits and not is_agent_reply):
+            return "RECIPIENT_NOT_ALLOWED"
+
+        # 2. Group authorization
+        if isinstance(jid, str) and jid.endswith("@g.us") and not allow_group:
+            return "GROUP_DISPATCH_DISABLED"
+
+        # 3. Direct or LID target verification
+        valid_direct = False
+        valid_lid = False
+        if isinstance(jid, str) and jid.endswith(("@c.us", "@s.whatsapp.net")):
+            jid_digits = _digits(jid.split("@")[0])
+            valid_direct = bool(jid_digits and phone_digits and jid_digits == phone_digits)
+        elif isinstance(jid, str) and jid.endswith("@lid") and hasattr(self, "resolve_lid"):
+            mapped = self.resolve_lid(jid)
+            valid_lid = bool(mapped and phone_digits and _digits(mapped.get("phone")) == phone_digits)
+
+        if not valid_direct and not valid_lid and not (isinstance(jid, str) and jid.endswith("@g.us") and allow_group):
+            return "RECIPIENT_NOT_ALLOWED"
+
+        # 4. Contact profile block check
+        cprof = self.get_contact(jid) if hasattr(self, "get_contact") else None
+        if cprof and cprof.get("category") in ("FAMILY_PERSONAL", "IGNORED"):
+            return "RECIPIENT_BLOCKED"
+
+        # 5. Allowed phones filter (not applied to manual sends during dispatch, nor to agent replies)
+        if allowed_phones is not None and not is_agent_reply:
+            if is_dispatch and is_manual:
+                pass
+            else:
+                allowed_digits_set = {_digits(p) for p in allowed_phones}
+                if phone_digits not in allowed_digits_set:
+                    return "RECIPIENT_UNAVAILABLE" if is_dispatch else "RECIPIENT_NOT_ALLOWED"
+
+        return None
+
     # --- Verified 2-Phase WhatsApp Outbound Queue ---
     def queue_outbound(self, recipient_jid, text_parts, *, kind="quote", recipient_phone=None, account_phone=None, attachment_path=None, caption=None, status="DRAFT", delay_ms=0, meta=None, dedupe_key=None):
         norm_status = "READY" if status in ("APPROVED", "READY") else status
         oid = "out-" + (uuid.uuid5(uuid.NAMESPACE_OID, dedupe_key).hex[:16] if dedupe_key else uuid.uuid4().hex[:16])
         now = time.time()
+        meta_dict = dict(meta or {})
+        parts_list = list(text_parts)
+
         with self._lock:
+            if dedupe_key:
+                existing = self._conn.execute("SELECT id, status FROM outbound_queue WHERE id=?", (oid,)).fetchone()
+                if existing:
+                    # Duplicate enqueue returns the existing intent without changing claim or terminal outcome
+                    return existing["id"]
+
             self._conn.execute(
                 """INSERT OR IGNORE INTO outbound_queue(id, recipient_jid, recipient_phone, kind, text_parts_json, attachment_path, caption, status, delay_ms, created_at, updated_at, meta_json)
                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (oid, recipient_jid, recipient_phone, kind, json.dumps(list(text_parts), ensure_ascii=False), attachment_path, caption, norm_status, int(delay_ms), now, now, json.dumps(meta or {}, ensure_ascii=False)),
+                (oid, recipient_jid, recipient_phone, kind, json.dumps(parts_list, ensure_ascii=False), attachment_path, caption, norm_status, int(delay_ms), now, now, json.dumps(meta_dict, ensure_ascii=False)),
             )
-            if dedupe_key:
-                existing = self._conn.execute("SELECT id FROM outbound_queue WHERE id=?", (oid,)).fetchone()
-                if existing:
-                    oid = existing["id"]
             if norm_status == "READY":
-                bound_account = account_phone or recipient_phone
+                bound_account = account_phone
+                if not bound_account:
+                    prof = self.get_local_state("whatsapp_profile") if hasattr(self, "get_local_state") else {}
+                    bound_account = (prof or {}).get("owner_phone") or (prof or {}).get("phone")
+                if not bound_account:
+                    setup_cfg = self.get_sync("configuration", "setup") if hasattr(self, "get_sync") else {}
+                    bound_account = (setup_cfg or {}).get("owner_phone")
+                # F09: never bind a buyer as owner! Only allow recipient_phone fallback for manual broadcast without configured owner
+                if not bound_account and kind == "manual":
+                    bound_account = recipient_phone
                 if bound_account:
+                    # F09: never destroy active claim on dedupe
                     self._conn.execute(
-                        "INSERT OR REPLACE INTO outbound_dispatch(id, account_phone, expires_at) VALUES(?, ?, ?)",
+                        "INSERT OR IGNORE INTO outbound_dispatch(id, account_phone, expires_at) VALUES(?, ?, ?)",
                         (oid, bound_account, now + 300),
                     )
             self._conn.commit()
@@ -1339,31 +1478,15 @@ class SQLiteSyncedRepository:
                         return "DRAFT_CHANGED"
             if manual_only and row["kind"] != "manual":
                 return "MANUAL_SEND_ONLY"
-            phone = row["recipient_phone"]
-            def _digits(p):
-                return re.sub(r"\D", "", str(p or ""))
 
-            phone_digits = _digits(phone)
-            account_digits = _digits(account_phone)
-            is_agent_reply = (row["kind"] == "agent_reply")
-            if not phone_digits or not account_digits or (phone_digits == account_digits and not is_agent_reply):
-                return "RECIPIENT_NOT_ALLOWED"
+            target_err = self._verify_outbound_target(dict(row), account_phone, allowed_phones)
+            if target_err:
+                return target_err
+
+            phone = row["recipient_phone"]
             jid = row["recipient_jid"]
-            jid_digits = _digits(jid.split("@")[0]) if isinstance(jid, str) and "@" in jid else ""
-            valid_direct = bool(jid_digits and jid_digits == phone_digits and isinstance(jid, str) and jid.endswith(("@c.us", "@s.whatsapp.net")))
-            valid_lid = False
-            if isinstance(jid, str) and jid.endswith("@lid") and hasattr(self, "resolve_lid"):
-                mapped = self.resolve_lid(jid)
-                valid_lid = bool(mapped and _digits(mapped.get("phone")) == phone_digits)
-            if not valid_direct and not valid_lid:
-                return "RECIPIENT_NOT_ALLOWED"
-            cprof = self.get_contact(jid) if hasattr(self, "get_contact") else None
-            if cprof and cprof.get("category") in ("FAMILY_PERSONAL", "IGNORED"):
-                return "RECIPIENT_BLOCKED"
-            if allowed_phones is not None and not is_agent_reply:
-                allowed_digits_set = {_digits(p) for p in allowed_phones}
-                if phone_digits not in allowed_digits_set:
-                    return "RECIPIENT_NOT_ALLOWED"
+            is_manual = (row["kind"] == "manual")
+
             parts = json.loads(row["text_parts_json"])
             metadata = json.loads(row["meta_json"])
             att_path = row["attachment_path"]
@@ -1378,9 +1501,10 @@ class SQLiteSyncedRepository:
                 return "UNSUPPORTED_MESSAGE"
             if row["kind"] in ("quote", "scheduled_quote") and not self._quote_is_current(row, metadata):
                 return "QUOTE_REQUIRES_REVIEW"
-            if (self.is_chat_muted(phone[1:] + "@c.us")
-                    or self.is_chat_muted(phone[1:] + "@s.whatsapp.net")
-                    or (isinstance(jid, str) and self.is_chat_muted(jid))):
+            if (
+                (phone and (self.is_chat_muted(phone[1:] + "@c.us") or self.is_chat_muted(phone[1:] + "@s.whatsapp.net")))
+                or (isinstance(jid, str) and self.is_chat_muted(jid))
+            ):
                 return "RECIPIENT_MUTED"
             now = time.time()
             self._conn.execute(
@@ -1410,15 +1534,36 @@ class SQLiteSyncedRepository:
                 (time.time(), oid),
             ).rowcount == 1
 
+    def register_sent_receipt(self, message_id):
+        if not isinstance(message_id, str) or not message_id:
+            return
+        now = time.time()
+        with self._lock:
+            stale = [k for k, ts in self._recent_sent_ids.items() if now - ts > 300]
+            for k in stale:
+                del self._recent_sent_ids[k]
+            for c in normalize_whatsapp_msg_id(message_id):
+                self._recent_sent_ids[c] = now
+
     def has_outbound_receipt(self, message_id):
         if not isinstance(message_id, str) or not message_id:
             return False
+        candidates = normalize_whatsapp_msg_id(message_id)
+        now = time.time()
         with self._lock:
-            return self._conn.execute(
-                """SELECT 1 FROM outbound_queue q, json_each(q.meta_json, '$.sent_ids') receipt
-                   WHERE q.status='ACCEPTED' AND receipt.value=? LIMIT 1""",
-                (message_id,),
-            ).fetchone() is not None
+            for c in candidates:
+                if c in self._recent_sent_ids and (now - self._recent_sent_ids[c]) < 180:
+                    return True
+            for c in candidates:
+                row = self._conn.execute(
+                    """SELECT 1 FROM outbound_queue q, json_each(q.meta_json, '$.sent_ids') receipt
+                       WHERE q.status IN ('ACCEPTED', 'IN_FLIGHT', 'UNKNOWN')
+                         AND (receipt.value = ? OR receipt.value LIKE ?) LIMIT 1""",
+                    (c, f"%{c}"),
+                ).fetchone()
+                if row is not None:
+                    return True
+        return False
 
     def revoke_outbound(self):
         with self._lock, self._conn:
@@ -1428,10 +1573,24 @@ class SQLiteSyncedRepository:
             )
 
     def _expire_outbound(self, now):
+        expired_in_flight = self._conn.execute(
+            """SELECT q.id, q.meta_json FROM outbound_queue q JOIN outbound_dispatch d ON q.id=d.id
+               WHERE q.status='IN_FLIGHT' AND d.expires_at<=?""",
+            (now,),
+        ).fetchall()
+        for r in expired_in_flight:
+            m = json.loads(r["meta_json"] or "{}")
+            m["failure_reason"] = "IN_FLIGHT_EXPIRED"
+            m["reason"] = "IN_FLIGHT_EXPIRED"
+            self._conn.execute(
+                "UPDATE outbound_queue SET status='UNKNOWN', updated_at=?, meta_json=? WHERE id=?",
+                (now, json.dumps(m, ensure_ascii=False), r["id"]),
+            )
+
         self._conn.execute(
             """UPDATE outbound_queue
-               SET status=CASE status WHEN 'IN_FLIGHT' THEN 'UNKNOWN' ELSE 'EXPIRED' END, updated_at=?
-               WHERE status IN ('READY','CLAIMED','IN_FLIGHT')
+               SET status='EXPIRED', updated_at=?
+               WHERE status IN ('READY','CLAIMED')
                  AND id IN (SELECT id FROM outbound_dispatch WHERE expires_at<=?)""",
             (now, now),
         )
@@ -1474,7 +1633,7 @@ class SQLiteSyncedRepository:
                     return {"error": "INVALID_DISPATCH_RESULT"}
                 if outcome == "ACCEPTED" and (
                     status not in ("IN_FLIGHT", "UNKNOWN", "ACCEPTED") or not isinstance(ids, list)
-                    or len(ids) != 1 or not isinstance(ids[0], str) or not ids[0].strip() or len(ids[0]) > 300
+                    or len(ids) < 1 or not all(isinstance(x, str) and x.strip() and len(x) <= 300 for x in ids)
                 ):
                     return {"error": "MISSING_PROVIDER_RECEIPT"}
                 if status == "ACCEPTED" and outcome == "ACCEPTED" and ids != json.loads(row["meta_json"]).get("sent_ids"):
@@ -1484,12 +1643,28 @@ class SQLiteSyncedRepository:
                 if status not in ("CLAIMED", "IN_FLIGHT", "UNKNOWN") or (status == "UNKNOWN" and outcome != "ACCEPTED"):
                     return {"error": "DISPATCH_ALREADY_CLOSED"}
                 meta = json.loads(row["meta_json"])
+                reason = body.get("reason") or body.get("error")
                 if outcome == "ACCEPTED":
                     meta["sent_ids"] = ids
+                    for mid in ids:
+                        self.register_sent_receipt(mid)
+                elif outcome in ("FAILED_BEFORE_SEND", "UNKNOWN"):
+                    if reason:
+                        meta["failure_reason"] = reason
+                        meta["reason"] = reason
+                if body.get("provider_id"):
+                    meta["provider_id"] = body["provider_id"]
+                if body.get("transport"):
+                    meta["transport"] = body["transport"]
+                if body.get("parts_sent") is not None:
+                    meta["parts_sent"] = body["parts_sent"]
+
                 self._conn.execute(
                     "UPDATE outbound_queue SET status=?, updated_at=?, meta_json=? WHERE id=?",
-                    (outcome, now, json.dumps(meta), oid),
+                    (outcome, now, json.dumps(meta, ensure_ascii=False), oid),
                 )
+                if outcome in ("ACCEPTED", "FAILED_BEFORE_SEND"):
+                    self._conn.execute("DELETE FROM outbound_dispatch WHERE id=?", (oid,))
                 return {"ok": True}
             if not enabled:
                 return {"error": "DISPATCH_DISABLED"}
@@ -1497,27 +1672,23 @@ class SQLiteSyncedRepository:
                 return {"error": "MANUAL_SEND_ONLY"}
             if not account_phone or account_phone != row["account_phone"] or (body.get("account_phone") and body.get("account_phone") != account_phone):
                 return {"error": "ACCOUNT_MISMATCH"}
+
+            # Shared Target Verification across all origins (Turbo, scheduled, merge, manual)
+            target_err = self._verify_outbound_target(dict(row), account_phone, allowed_phones, is_dispatch=True)
+            if target_err:
+                return {"error": target_err}
+
             phone = row["recipient_phone"]
             jid = row["recipient_jid"]
             is_manual = (row["kind"] == "manual")
-            is_agent_reply = (row["kind"] == "agent_reply")
 
-            def _digits(p):
-                return re.sub(r"\D", "", str(p or ""))
-
-            if (self.is_chat_muted(phone[1:] + "@c.us")
-                    or self.is_chat_muted(phone[1:] + "@s.whatsapp.net")
-                    or (isinstance(jid, str) and self.is_chat_muted(jid))):
-                return {"error": "RECIPIENT_MUTED"}
-
-            cprof = self.get_contact(jid) if hasattr(self, "get_contact") else None
-            if cprof and cprof.get("category") in ("FAMILY_PERSONAL", "IGNORED"):
-                return {"error": "RECIPIENT_BLOCKED"}
-
-            if not is_manual and not is_agent_reply and allowed_phones is not None:
-                allowed_digits_set = {_digits(p) for p in allowed_phones}
-                if _digits(phone) not in allowed_digits_set:
-                    return {"error": "RECIPIENT_UNAVAILABLE"}
+            # Mute check: allow trader's manual follow-up from composer/UI
+            if not is_manual:
+                if (
+                    (phone and (self.is_chat_muted(phone[1:] + "@c.us") or self.is_chat_muted(phone[1:] + "@s.whatsapp.net")))
+                    or (isinstance(jid, str) and self.is_chat_muted(jid))
+                ):
+                    return {"error": "RECIPIENT_MUTED"}
 
             if row["kind"] in ("quote", "scheduled_quote") and not self._quote_is_current(row, json.loads(row["meta_json"])):
                 return {"error": "QUOTE_REQUIRES_REVIEW"}

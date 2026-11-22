@@ -198,6 +198,10 @@ class ContactTagParams(Params):
     category: str = Field(pattern=r"^(VIP_BUYER|SUPPLIER_DEALER|WHOLESALE_GROUP|FAMILY_PERSONAL|IGNORED|UNKNOWN)$")
 
 
+class ContactUnmuteParams(Params):
+    conversation_id: str = Field(min_length=3, max_length=120)
+
+
 class WaScanModeParams(Params):
     mode: Literal["new_only", "all"] = "new_only"
 
@@ -1163,6 +1167,23 @@ class DesktopService:
         if isinstance(prof, dict) and prof.get("verified") is True:
             owner = self.configuration["data"].get("owner_phone") if self.configuration else None
             await self.runner._store_profile(prof, owner_phone=owner)
+        human_replies = params.get("human_replies")
+        if isinstance(human_replies, list) and hasattr(self.repo, "upsert_contact"):
+            cfg = await settings(self.repo)
+            mute_sec = float(cfg.get("human_mute_hours") or self.runner.human_mute_hours or 4.0) * 3600.0
+            now = time.time()
+            for hr in human_replies:
+                cid = hr.get("conversation_id") if isinstance(hr, dict) else None
+                if not cid:
+                    continue
+                message_id = hr.get("message_id")
+                if hasattr(self.repo, "has_outbound_receipt") and self.repo.has_outbound_receipt(message_id):
+                    continue
+                stamp = hr.get("timestamp")
+                remaining = mute_sec if type(stamp) not in (int, float) else min(mute_sec, stamp + mute_sec - now)
+                if remaining > 0:
+                    self.repo.upsert_contact(cid, manual_mute_seconds=remaining)
+            self.emit("data-updated", {"collections": ["contacts", "outbound"]})
         events = params.get("events")
         saved_count = 0
         results = []
@@ -1914,6 +1935,17 @@ class DesktopService:
                     approved = True
                 else:
                     reason = self.repo.approve_outbound(oid, None, owner, allowed_phones=None, manual_only=False)
+                    if reason == "RECIPIENT_MUTED":
+                        # Human composer follow-up is explicitly permitted by handoff contract
+                        import time as _t
+                        now = _t.time()
+                        with self.repo._lock, self.repo._conn:
+                            self.repo._conn.execute(
+                                "INSERT OR REPLACE INTO outbound_dispatch(id, account_phone, expires_at) VALUES(?, ?, ?)",
+                                (oid, owner, now + 120),
+                            )
+                            self.repo._conn.execute("UPDATE outbound_queue SET status='READY', updated_at=? WHERE id=?", (now, oid))
+                        reason = None
                     approved = (reason is None)
         curr_item = self.repo.get_outbound(oid) if hasattr(self.repo, "get_outbound") else None
         current_status = curr_item["status"] if curr_item else ("READY" if approved else "DRAFT")
@@ -1989,6 +2021,8 @@ class DesktopService:
             raise DesktopError("INVALID_INPUT", "Invalid dispatch operation.")
         setup = self.runner.cached_setup or {}
         owner = setup.get("owner_phone")
+        if not owner and params.get("account_phone"):
+            owner = params.get("account_phone")
         allowed = {s["phone"] for s in setup.get("sources", []) if s.get("active", True)}
         manual_only = (self.runner.autonomy_mode == "send")
         result = self.repo.dispatch_outbound(
@@ -2011,6 +2045,20 @@ class DesktopService:
             raise DesktopError("UNSUPPORTED", "Contact categorization requires local store.")
         self.repo.upsert_contact(value.conversation_id, category=value.category)
         return {"ok": True, "conversation_id": value.conversation_id, "category": value.category}
+
+    async def contacts_unmute(self, params):
+        value = ContactUnmuteParams.model_validate(params)
+        if hasattr(self.repo, "unmute_chat"):
+            self.repo.unmute_chat(value.conversation_id)
+        self.emit("data-updated", {"collections": ["contacts", "outbound"]})
+        return {"ok": True, "conversation_id": value.conversation_id}
+
+    async def contacts_mute_status(self, params):
+        value = ContactUnmuteParams.model_validate(params)
+        if hasattr(self.repo, "get_chat_mute_status"):
+            st = self.repo.get_chat_mute_status(value.conversation_id)
+            return {"conversation_id": value.conversation_id, **st}
+        return {"conversation_id": value.conversation_id, "muted": False, "remaining_seconds": 0.0}
 
     async def scheduler_list(self, params):
         Params.model_validate(params)
@@ -2175,7 +2223,7 @@ class DesktopService:
             routes.update({"diagnostics/logs": self.diagnostics_logs, "diagnostics/clear": self.diagnostics_clear})
             routes.update({"fx/convert":self.fx_convert,"fx/currencies":self.fx_currencies,"fx/world":self.fx_world,"fx/history":self.fx_history})
             routes.update({"provider/reveal":self.reveal_provider_key,"provider/discover":self.discover_provider,"profile/sync":self.sync_profile,"sheet/prepare":self.prepare_sheet,"bridge/open":self.open_browser,"extension/pair":self.extension_pair,"bridge/pair":self.extension_pair,"wa/sync":self.wa_sync,"wa/scan-mode":self.wa_scan_mode})
-            routes.update({"outbound/list":self.outbound_list,"outbound/create":self.outbound_create,"outbound/action":self.outbound_action,"outbound/dispatch":self.outbound_dispatch,"contacts/list":self.contacts_list,"contacts/tag":self.contacts_tag,"scheduler/list":self.scheduler_list})
+            routes.update({"outbound/list":self.outbound_list,"outbound/create":self.outbound_create,"outbound/action":self.outbound_action,"outbound/dispatch":self.outbound_dispatch,"contacts/list":self.contacts_list,"contacts/tag":self.contacts_tag,"contacts/unmute":self.contacts_unmute,"contacts/mute-status":self.contacts_mute_status,"scheduler/list":self.scheduler_list})
             routes["inventory/daily-stock"] = self.daily_stock_status
             routes["message/trace"] = self.message_trace
             if request.method not in routes:

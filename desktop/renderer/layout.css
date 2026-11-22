@@ -3266,6 +3266,18 @@ body.view-whatsapp-mode .content {
   margin-left: 6px;
 }
 
+.wa-mute-badge {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: rgba(239, 68, 68, 0.15);
+  color: #ef4444;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .wa-main {
   display: flex;
   flex-direction: column;
