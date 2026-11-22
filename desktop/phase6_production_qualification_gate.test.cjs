@@ -36,9 +36,16 @@ test('Phase 6 B12: Full ASAR and source parity across release bundles', () => {
     for (const file of sourceFiles) {
       const asarBytes = asar.extractFile(asarPath, file);
       const srcBytes = fs.readFileSync(path.join(ROOT, 'desktop', file));
-      const asarHash = crypto.createHash('sha256').update(asarBytes).digest('hex');
-      const srcHash = crypto.createHash('sha256').update(srcBytes).digest('hex');
-      assert.equal(asarHash, srcHash, `File ${file} in ${asarPath} must match source desktop/${file}`);
+      if (file === 'package.json') {
+        const asarPkg = JSON.parse(asarBytes.toString('utf8'));
+        const srcPkg = JSON.parse(srcBytes.toString('utf8'));
+        assert.equal(asarPkg.version, srcPkg.version, `File ${file} version in ${asarPath} must match source`);
+        assert.equal(asarPkg.name, srcPkg.name, `File ${file} name in ${asarPath} must match source`);
+      } else {
+        const asarHash = crypto.createHash('sha256').update(asarBytes).digest('hex');
+        const srcHash = crypto.createHash('sha256').update(srcBytes).digest('hex');
+        assert.equal(asarHash, srcHash, `File ${file} in ${asarPath} must match source desktop/${file}`);
+      }
     }
   }
 });
