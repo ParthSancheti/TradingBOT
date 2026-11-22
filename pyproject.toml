@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis-trade"
+version = "0.2.0"
+description = "WhatsApp trading control plane with fail-closed administrative access"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "Babel==2.18.0", "Pillow==13.0.0",
+  "fastapi==0.162.2", "uvicorn[standard]==0.54.0", "sqlalchemy==2.1.8", "psycopg[binary]==3.3.8",
+  "pydantic-settings==2.16.2", "authlib==1.9.5", "httpx==0.28.1", "httpx2==2.16.0", "cryptography==50.0.2", "langgraph==1.2.20", "keyring==25.7.0", "phonenumbers==9.0.43", "websockets==17.4", "edge-tts>=7.0,<8.0", "tzdata>=2026.1", "pywin32==312; sys_platform == 'win32'"
+]
+
+[project.optional-dependencies]
+test = ["pytest==9.2.0", "pytest-asyncio==1.4.1.post1", "pip-audit==2.10.1"]
+
+[tool.setuptools.packages.find]
+where = ["backend"]
+
+[tool.setuptools.package-data]
+jarvis = ["web/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+

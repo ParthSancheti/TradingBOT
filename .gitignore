@@ -1,0 +1,45 @@
+# Environments and secrets
+.venv/
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.spec
+
+# Database & runtime
+*.sqlite3
+*.sqlite3-*
+.runtime/
+*.log
+
+# Security keys & certificates
+*.key
+*.pem
+
+# Node.js & Desktop packaging
+node_modules/
+artifacts/
+release/
+*.zip
+*.tar.gz
+packager-temp/
+
+# OS and Editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Agent / Tooling metadata
+.agent/
+.planning/

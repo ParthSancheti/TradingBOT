@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Jarvis-Trade Bridge",
+  "version": "0.7.0",
+  "web_accessible_resources":[{"resources":["icons/*","vendor/wppconnect-wa.js"],"matches":["https://web.whatsapp.com/*"]}],
+  "icons":{"16":"icons/jarvis-16.png","32":"icons/jarvis-32.png","48":"icons/jarvis-48.png","128":"icons/jarvis-128.png"},
+  "description": "Connects WhatsApp Web to your desktop AI trading agent (single-tab scan, search, profile sync & supervised messaging).",
+  "permissions": ["nativeMessaging", "tabs", "activeTab", "scripting", "alarms", "storage"],
+  "host_permissions": ["https://web.whatsapp.com/*", "https://*.whatsapp.net/*", "https://*.fbcdn.net/*"],
+  "background": {"service_worker": "background.js", "type": "module"},
+  "content_scripts": [{"matches":["https://web.whatsapp.com/*"],"js":["wake.js"],"run_at":"document_idle","all_frames":false}],
+  "action": {"default_popup": "status.html","default_icon":{"16":"icons/jarvis-16.png","32":"icons/jarvis-32.png"}},
+  "content_security_policy": {"extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'"}
+}
+

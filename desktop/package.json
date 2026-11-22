@@ -1,0 +1,27 @@
+{
+  "name": "jarvis-trade-desktop",
+  "productName": "Jarvis Trade",
+  "version": "0.5.8",
+  "description": "Jarvis Trade desktop control centre",
+  "private": true,
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test shell.test.cjs voice-filter.test.cjs",
+    "package": "node scripts/package.cjs"
+  },
+  "overrides": {
+    "glob": "14.0.4",
+    "minimatch": "11.0.5"
+  },
+  "devDependencies": {
+    "@electron/packager": "20.3.0",
+    "electron": "45.2.3"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "@wppconnect/wa-js": "^4.8.2",
+    "pino": "^10.4.0",
+    "qrcode": "^1.5.4"
+  }
+}
